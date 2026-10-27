@@ -1,0 +1,135 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b1bac58..2227510 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -399,42 +399,60 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
+-		}
++		/* Clip against the source surface, in logical pixels. */
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+ 		}
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
+-		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++		/*
++		 * The presented display is fLogicalW x fLogicalH -- the iPhone X
++		 * geometry UIKit carries status bar and safe-area data for -- while
++		 * the panel is fWidth x fHeight. Scale the logical rectangle onto
++		 * the panel rather than centre-cropping it.
++		 *
++		 * Cropping (the previous behaviour) removed 78 px at the top and
++		 * bottom, which is exactly where the status bar and the home
++		 * indicator sit: both survived as clipped slivers and the bottom
++		 * edge gesture had no reachable home indicator to start from.
++		 * Scaling keeps every UIKit element inside the panel.
++		 */
++		int32_t pw = (int32_t)(((int64_t)w * (int64_t)fWidth) / (int64_t)fLogicalW);
++		int32_t ph = (int32_t)(((int64_t)h * (int64_t)fHeight) / (int64_t)fLogicalH);
++		int32_t px = (int32_t)(((int64_t)dx * (int64_t)fWidth) / (int64_t)fLogicalW);
++		int32_t py = (int32_t)(((int64_t)dy * (int64_t)fHeight) / (int64_t)fLogicalH);
++		if (px < 0) {
++			px = 0;
++		}
++		if (py < 0) {
++			py = 0;
++		}
++		if (pw > (int32_t)fWidth - px) {
++			pw = (int32_t)fWidth - px;
++		}
++		if (ph > (int32_t)fHeight - py) {
++			ph = (int32_t)fHeight - py;
++		}
++		if (src != 0 && bpe == 4 && pw > 0 && ph > 0) {
++			/* Nearest neighbour: the source is a RAM surface and this
++			 * runs at sweetfb_hz, so the extra cost of filtering is not
++			 * worth it at 10-20 fps. */
++			for (int32_t y = 0; y < ph; y++) {
++				int32_t ysrc = sy + (int32_t)(((int64_t)y * (int64_t)h) / (int64_t)ph);
++				uint32_t *drow = (uint32_t *)(fPixels +
++				    (uint64_t)(py + y) * fRowBytes) + px;
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)ysrc * s->bytesPerRow) + sx;
++				for (int32_t x = 0; x < pw; x++) {
++					drow[x] = srow[(int32_t)(((int64_t)x * (int64_t)w) / (int64_t)pw)];
++				}
+ 			}
+ 		}
+ 		s->release();
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a987d92..1b14541 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -459,21 +459,36 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > 2279 ? 2279 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/*
++	 * Panel pixel -> normalised display position.
++	 *
++	 * swap() now scales the entire logical display onto the panel, so a
++	 * panel coordinate already spans the full 0..1 range of what UIKit
++	 * considers the screen: dividing by the panel size is exact. The old
++	 * form added the crop offset and divided by the logical size, which
++	 * both skewed every tap downward and left the bottom of the screen
++	 * unreachable.
++	 */
++	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
++	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2280);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		/* Panel-relative, so "bottom edge" means the bottom of the
++		 * panel (2279) and not the bottom of a 2340/2436-tall display
++		 * the kernel never presents. The old constant made the y test
++		 * unreachable, which disabled the home and app-switcher
++		 * gestures entirely. */
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1080 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > 2280 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
