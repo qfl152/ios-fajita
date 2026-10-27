@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..c4ff134 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -73,6 +73,30 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * Diagnostic hook: freeze with the USB state on screen.
++ *
++ * sweetusbhalt=1 parks the boot right where the probe decides, so the GDSCR
++ * and CBCR values stay readable instead of scrolling off. The controller on
++ * this board reports unpowered, which makes the normal path return before the
++ * DWC3 registers are touched; that early return is exactly what needs to be
++ * seen.
++ */
++static void
++sweet_usb_halt(void)
++{
++	int halt = 0;
++
++	PE_parse_boot_argn("sweetusbhalt", &halt, sizeof(halt));
++	if (!halt) {
++		return;
++	}
++	printf("SWEET USB: sweetusbhalt=1, holding here\n");
++	for (;;) {
++		__asm__ volatile ("wfe" ::: "memory");
++	}
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -101,6 +125,7 @@ sweet_usb_probe(void)
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
++		sweet_usb_halt();
+ 		return;
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+@@ -132,6 +157,7 @@ sweet_usb_probe(void)
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+ 	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	sweet_usb_halt();
+ }
+ 
+ /*
