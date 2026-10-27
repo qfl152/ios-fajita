@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c4ff134..19a1053 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -97,6 +97,62 @@ sweet_usb_halt(void)
+ 	}
+ }
+ 
++/*
++ * Bring the USB30_PRIM power domain and its clocks up.
++ *
++ * ABL collapses the domain on hand-off: measured GDSCR 0x00222001 (bit0
++ * SW_COLLAPSE set, bit31 POWER_DOMAIN_STATUS clear) and five of seven CBCRs
++ * reading 0x80000000 (CLK_OFF). Only ahb2phy and clkref are left running.
++ *
++ * Every step below is a read-modify-write of one documented bit and is
++ * skipped when the hardware already reports the wanted state, so running it
++ * unconditionally is safe and idempotent.
++ */
++static void
++sweet_usb_power_on(vm_offset_t gcc)
++{
++	uint32_t v, i;
++
++	/* GDSC: clear SW_COLLAPSE (bit0), then wait for POWER_DOMAIN_STATUS (bit31). */
++	v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: power: GDSCR in  0x%08x\n", v);
++	if (!(v & (1u << 31))) {
++		*(volatile uint32_t *)(gcc + GCC_USB30_PRIM_GDSCR) = v & ~1u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 2000; i++) {
++			if (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)) {
++				break;
++			}
++			delay(50);
++		}
++		v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		printf("SWEET USB: power: GDSCR out 0x%08x (%s after %u us)\n",
++		    v, (v & (1u << 31)) ? "ON" : "STILL-OFF", i * 50);
++		if (!(v & (1u << 31))) {
++			return;         /* no point touching the clocks */
++		}
++	}
++
++	/* CBCR: set CLK_ENABLE (bit0), wait for CLK_OFF (bit31) to clear. */
++	for (unsigned k = 0; k < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); k++) {
++		v = usb_rd(gcc, usb_cbcr[k].off);
++		if (!(v & CBCR_CLK_OFF)) {
++			continue;       /* already running */
++		}
++		*(volatile uint32_t *)(gcc + usb_cbcr[k].off) = v | 1u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 2000; i++) {
++			if (!(usb_rd(gcc, usb_cbcr[k].off) & CBCR_CLK_OFF)) {
++				break;
++			}
++			delay(50);
++		}
++		v = usb_rd(gcc, usb_cbcr[k].off);
++		printf("SWEET USB: power: clk %-12s 0x%08x (%s)\n", usb_cbcr[k].name, v,
++		    (v & CBCR_CLK_OFF) ? "STILL-OFF" : "on");
++	}
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -114,6 +170,13 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	{
++		int power = 1;
++		PE_parse_boot_argn("sweetusbpower", &power, sizeof(power));
++		if (power) {
++			sweet_usb_power_on(gcc);
++		}
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
